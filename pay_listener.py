@@ -345,7 +345,7 @@ class WeChatHook:
             return
 
         self._hwnd = user32.CreateWindowExW(
-            0, "PayListenerWnd", "PayListener", 0,
+            0, "PayListenerWnd", "支付监听回调", 0,
             0, 0, 0, 0, None, None, wc.hInstance, None,
         )
         if not self._hwnd:
