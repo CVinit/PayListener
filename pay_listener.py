@@ -79,6 +79,8 @@ kernel32.CreateRemoteThread.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes
 kernel32.CreateRemoteThread.restype = wintypes.HANDLE
 kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
 kernel32.WaitForSingleObject.restype = wintypes.DWORD
+kernel32.GetExitCodeThread.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+kernel32.GetExitCodeThread.restype = wintypes.BOOL
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 kernel32.CloseHandle.restype = wintypes.BOOL
 
@@ -275,11 +277,12 @@ class WeChatHook:
             log.error("DLL 文件不存在: %s", self.dll_path)
             return False
 
+        log.debug("注入 DLL 路径: %s", self.dll_path)
         dll_path_bytes = self.dll_path.encode("utf-8") + b"\x00"
 
         h_process = kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, pid)
         if not h_process:
-            log.error("无法打开进程 %d", pid)
+            log.error("无法打开进程 %d (GetLastError=%d)", pid, kernel32.GetLastError())
             return False
 
         try:
@@ -288,7 +291,7 @@ class WeChatHook:
                 MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE,
             )
             if not remote_mem:
-                log.error("VirtualAllocEx 失败")
+                log.error("VirtualAllocEx 失败 (GetLastError=%d)", kernel32.GetLastError())
                 return False
 
             written = ctypes.c_size_t(0)
@@ -296,7 +299,7 @@ class WeChatHook:
                 h_process, remote_mem, dll_path_bytes,
                 len(dll_path_bytes), ctypes.byref(written),
             ):
-                log.error("WriteProcessMemory 失败")
+                log.error("WriteProcessMemory 失败 (GetLastError=%d)", kernel32.GetLastError())
                 return False
 
             h_kernel32 = kernel32.GetModuleHandleW("kernel32.dll")
@@ -309,12 +312,19 @@ class WeChatHook:
                 h_process, None, 0, load_library_addr, remote_mem, 0, None,
             )
             if not h_thread:
-                log.error("CreateRemoteThread 失败")
+                log.error("CreateRemoteThread 失败 (GetLastError=%d)", kernel32.GetLastError())
                 return False
 
             kernel32.WaitForSingleObject(h_thread, INFINITE)
+            exit_code = wintypes.DWORD(0)
+            kernel32.GetExitCodeThread(h_thread, ctypes.byref(exit_code))
             kernel32.CloseHandle(h_thread)
-            log.info("DLL 已注入微信 (PID=%d)", pid)
+
+            if exit_code.value == 0:
+                log.error("LoadLibraryA 返回 0, DLL 加载失败 (路径可能有中文或DLL架构不匹配)")
+                return False
+
+            log.info("DLL 已注入微信 (PID=%d, module=0x%08X)", pid, exit_code.value)
             return True
         finally:
             kernel32.CloseHandle(h_process)
@@ -322,11 +332,14 @@ class WeChatHook:
     def create_window(self):
         def wnd_proc(hwnd, msg, wparam, lparam):
             if msg == WM_COPYDATA:
+                log.debug("收到 WM_COPYDATA 消息")
                 cds = ctypes.cast(lparam, ctypes.POINTER(COPYDATASTRUCT)).contents
+                log.debug("  dwData=%d, cbData=%d, lpData=0x%X", cds.dwData, cds.cbData, cds.lpData or 0)
                 if cds.cbData > 0 and cds.lpData:
                     raw = ctypes.string_at(cds.lpData, cds.cbData)
                     try:
                         text = raw.decode("utf-8").rstrip("\x00")
+                        log.debug("  内容: %s", text[:200])
                         self._handle_message(text)
                     except Exception as e:
                         log.error("处理消息异常: %s", e)
@@ -352,7 +365,14 @@ class WeChatHook:
             log.error("CreateWindowExW 失败")
             return False
 
-        log.info("消息窗口已创建, 等待微信收款通知...")
+        log.info("消息窗口已创建 (HWND=0x%X)", self._hwnd)
+
+        verify_hwnd = user32.FindWindowW(None, "支付监听回调")
+        if verify_hwnd:
+            log.info("FindWindowW 验证成功 (HWND=0x%X)", verify_hwnd)
+        else:
+            log.error("FindWindowW 验证失败: 无法通过标题找到窗口")
+
         return True
 
     def run_message_loop(self):
