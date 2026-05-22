@@ -11,6 +11,7 @@ import json
 import logging
 import logging.handlers
 import os
+import queue
 import struct
 import sys
 import threading
@@ -286,9 +287,25 @@ class WeChatHook:
         self._hwnd = None
         self._on_payment = None
         self._wnd_proc_ref = None
+        self._payment_queue = queue.Queue()
+        self._worker_thread = None
 
     def set_payment_callback(self, callback):
         self._on_payment = callback
+        self._worker_thread = threading.Thread(
+            target=self._payment_worker, daemon=True
+        )
+        self._worker_thread.start()
+
+    def _payment_worker(self):
+        while True:
+            pay_type, amount = self._payment_queue.get()
+            try:
+                if self._on_payment:
+                    self._on_payment(pay_type, amount)
+            except Exception as e:
+                log.error("推送支付通知失败: %s", e)
+            self._payment_queue.task_done()
 
     def find_wechat_pid(self) -> int | None:
         for cls_name in ("WeChatMainWndForPC", "WeChatLoginWndForPC"):
@@ -526,8 +543,7 @@ class WeChatHook:
         amount = self._extract_amount(root)
         if amount:
             log.info("检测到微信收款: ￥%s", amount)
-            if self._on_payment:
-                self._on_payment(1, amount)
+            self._payment_queue.put((1, amount))
 
     def _extract_amount(self, root: ET.Element) -> str | None:
         # Format: <line><key><word>收款金额</word></key><value><word>￥X.XX</word></value></line>
