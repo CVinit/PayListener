@@ -215,18 +215,19 @@ class VmqClient:
     def __init__(self, config: Config):
         self.config = config
         self.session = requests.Session()
-        self.session.headers.update({
-            "Content-Type": "application/json; charset=utf-8",
-            "User-Agent": "PayListener/2.0",
-        })
+        self.session.headers.update({"User-Agent": "PayListener/2.0"})
+
+    @staticmethod
+    def _timestamp_ms() -> str:
+        return str(int(time.time() * 1000))
 
     def heartbeat(self) -> bool:
-        t = str(int(time.time()))
+        t = self._timestamp_ms()
         sign = md5hex(t + self.config.key)
         try:
             resp = self.session.post(
                 f"{self.config.base_url}/appHeart",
-                json={"t": t, "sign": sign},
+                data={"t": t, "sign": sign},
                 timeout=10,
             )
             result = resp.json()
@@ -239,12 +240,12 @@ class VmqClient:
             return False
 
     def push_payment(self, pay_type: int, price: str) -> bool:
-        t = str(int(time.time()))
+        t = self._timestamp_ms()
         sign = md5hex(str(pay_type) + price + t + self.config.key)
         try:
             resp = self.session.post(
                 f"{self.config.base_url}/appPush",
-                json={"type": str(pay_type), "price": price, "t": t, "sign": sign},
+                data={"type": str(pay_type), "price": price, "t": t, "sign": sign},
                 timeout=10,
             )
             result = resp.json()
