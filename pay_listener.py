@@ -278,7 +278,7 @@ class WeChatHook:
             return False
 
         log.debug("注入 DLL 路径: %s", self.dll_path)
-        dll_path_bytes = self.dll_path.encode("utf-8") + b"\x00"
+        dll_path_bytes = self.dll_path.encode("utf-16-le") + b"\x00\x00"
 
         h_process = kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, pid)
         if not h_process:
@@ -303,9 +303,9 @@ class WeChatHook:
                 return False
 
             h_kernel32 = kernel32.GetModuleHandleW("kernel32.dll")
-            load_library_addr = kernel32.GetProcAddress(h_kernel32, b"LoadLibraryA")
+            load_library_addr = kernel32.GetProcAddress(h_kernel32, b"LoadLibraryW")
             if not load_library_addr:
-                log.error("GetProcAddress(LoadLibraryA) 失败")
+                log.error("GetProcAddress(LoadLibraryW) 失败")
                 return False
 
             h_thread = kernel32.CreateRemoteThread(
@@ -321,7 +321,7 @@ class WeChatHook:
             kernel32.CloseHandle(h_thread)
 
             if exit_code.value == 0:
-                log.error("LoadLibraryA 返回 0, DLL 加载失败 (路径可能有中文或DLL架构不匹配)")
+                log.error("LoadLibraryW 返回 0, DLL 加载失败 (DLL可能是32位但微信是64位)")
                 return False
 
             log.info("DLL 已注入微信 (PID=%d, module=0x%08X)", pid, exit_code.value)
