@@ -11,6 +11,7 @@ import json
 import logging
 import logging.handlers
 import os
+import struct
 import sys
 import threading
 import time
@@ -59,11 +60,30 @@ MEM_COMMIT = 0x1000
 MEM_RESERVE = 0x2000
 PAGE_READWRITE = 0x04
 INFINITE = 0xFFFFFFFF
+TH32CS_SNAPMODULE = 0x00000008
+TH32CS_SNAPMODULE32 = 0x00000010
+MAX_MODULE_NAME32 = 255
+MAX_PATH = 260
 
 LRESULT = ctypes.c_ssize_t
 
 kernel32 = ctypes.windll.kernel32
 user32 = ctypes.windll.user32
+
+
+class MODULEENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("th32ModuleID", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("GlblcntUsage", wintypes.DWORD),
+        ("ProccntUsage", wintypes.DWORD),
+        ("modBaseAddr", ctypes.POINTER(ctypes.c_byte)),
+        ("modBaseSize", wintypes.DWORD),
+        ("hModule", wintypes.HMODULE),
+        ("szModule", ctypes.c_wchar * (MAX_MODULE_NAME32 + 1)),
+        ("szExePath", ctypes.c_wchar * MAX_PATH),
+    ]
 
 kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
 kernel32.OpenProcess.restype = wintypes.HANDLE
@@ -83,6 +103,14 @@ kernel32.GetExitCodeThread.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.
 kernel32.GetExitCodeThread.restype = wintypes.BOOL
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 kernel32.CloseHandle.restype = wintypes.BOOL
+kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+kernel32.Module32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MODULEENTRY32W)]
+kernel32.Module32FirstW.restype = wintypes.BOOL
+kernel32.Module32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MODULEENTRY32W)]
+kernel32.Module32NextW.restype = wintypes.BOOL
+kernel32.IsWow64Process.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
+kernel32.IsWow64Process.restype = wintypes.BOOL
 
 user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 user32.DefWindowProcW.restype = LRESULT
@@ -272,6 +300,113 @@ class WeChatHook:
                     return pid.value
         return None
 
+    def _is_target_wow64(self, h_process) -> bool:
+        is_wow64 = wintypes.BOOL(False)
+        kernel32.IsWow64Process(h_process, ctypes.byref(is_wow64))
+        return bool(is_wow64.value)
+
+    def _get_remote_kernel32_base(self, pid: int) -> int | None:
+        snap = kernel32.CreateToolhelp32Snapshot(
+            TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid
+        )
+        if snap == wintypes.HANDLE(-1).value or snap == -1:
+            log.error("CreateToolhelp32Snapshot 失败")
+            return None
+        try:
+            me = MODULEENTRY32W()
+            me.dwSize = ctypes.sizeof(MODULEENTRY32W)
+            if not kernel32.Module32FirstW(snap, ctypes.byref(me)):
+                return None
+            while True:
+                mod_name = me.szModule.lower()
+                if mod_name == "kernel32.dll":
+                    return ctypes.cast(me.modBaseAddr, ctypes.c_void_p).value
+                if not kernel32.Module32NextW(snap, ctypes.byref(me)):
+                    break
+        finally:
+            kernel32.CloseHandle(snap)
+        return None
+
+    def _get_load_library_addr(self, pid: int, h_process) -> int | None:
+        we_are_64 = ctypes.sizeof(ctypes.c_void_p) == 8
+        target_is_wow64 = self._is_target_wow64(h_process)
+
+        if we_are_64 and target_is_wow64:
+            log.debug("跨架构注入: 64位进程 -> 32位目标")
+            remote_k32_base = self._get_remote_kernel32_base(pid)
+            if not remote_k32_base:
+                log.error("无法获取目标进程 kernel32 基址")
+                return None
+            log.debug("目标 kernel32 基址: 0x%08X", remote_k32_base)
+
+            syswow64 = os.path.join(
+                os.environ.get("SystemRoot", r"C:\Windows"),
+                "SysWOW64", "kernel32.dll"
+            )
+            if not os.path.exists(syswow64):
+                log.error("找不到 32 位 kernel32: %s", syswow64)
+                return None
+
+            with open(syswow64, "rb") as f:
+                pe_data = f.read()
+
+            pe_off = struct.unpack_from("<I", pe_data, 0x3C)[0]
+            export_rva = struct.unpack_from("<I", pe_data, pe_off + 24 + 96)[0]
+
+            sections = []
+            num_sec = struct.unpack_from("<H", pe_data, pe_off + 6)[0]
+            opt_size = struct.unpack_from("<H", pe_data, pe_off + 20)[0]
+            sec_off = pe_off + 24 + opt_size
+            for i in range(num_sec):
+                s = sec_off + i * 40
+                va = struct.unpack_from("<I", pe_data, s + 12)[0]
+                raw_size = struct.unpack_from("<I", pe_data, s + 16)[0]
+                raw_ptr = struct.unpack_from("<I", pe_data, s + 20)[0]
+                v_size = struct.unpack_from("<I", pe_data, s + 8)[0]
+                sections.append((va, v_size, raw_ptr, raw_size))
+
+            def rva_to_file(rva):
+                for va, vs, rp, rs in sections:
+                    if va <= rva < va + max(vs, rs):
+                        return rp + (rva - va)
+                return None
+
+            exp_off = rva_to_file(export_rva)
+            if exp_off is None:
+                log.error("无法解析 kernel32 导出表")
+                return None
+
+            num_funcs = struct.unpack_from("<I", pe_data, exp_off + 24)[0]
+            num_names = struct.unpack_from("<I", pe_data, exp_off + 24)[0]
+            addr_table_rva = struct.unpack_from("<I", pe_data, exp_off + 28)[0]
+            name_table_rva = struct.unpack_from("<I", pe_data, exp_off + 32)[0]
+            ord_table_rva = struct.unpack_from("<I", pe_data, exp_off + 36)[0]
+
+            name_table_off = rva_to_file(name_table_rva)
+            addr_table_off = rva_to_file(addr_table_rva)
+            ord_table_off = rva_to_file(ord_table_rva)
+
+            for i in range(num_names):
+                name_rva = struct.unpack_from("<I", pe_data, name_table_off + i * 4)[0]
+                name_off = rva_to_file(name_rva)
+                end = pe_data.index(b"\x00", name_off)
+                name = pe_data[name_off:end]
+                if name == b"LoadLibraryW":
+                    ordinal = struct.unpack_from("<H", pe_data, ord_table_off + i * 2)[0]
+                    func_rva = struct.unpack_from("<I", pe_data, addr_table_off + ordinal * 4)[0]
+                    addr = remote_k32_base + func_rva
+                    log.debug("LoadLibraryW RVA=0x%X, 远程地址=0x%08X", func_rva, addr)
+                    return addr
+
+            log.error("在 32 位 kernel32 中找不到 LoadLibraryW")
+            return None
+        else:
+            h_kernel32 = kernel32.GetModuleHandleW("kernel32.dll")
+            addr = kernel32.GetProcAddress(h_kernel32, b"LoadLibraryW")
+            if not addr:
+                log.error("GetProcAddress(LoadLibraryW) 失败")
+            return addr
+
     def inject(self, pid: int) -> bool:
         if not os.path.exists(self.dll_path):
             log.error("DLL 文件不存在: %s", self.dll_path)
@@ -302,10 +437,8 @@ class WeChatHook:
                 log.error("WriteProcessMemory 失败 (GetLastError=%d)", kernel32.GetLastError())
                 return False
 
-            h_kernel32 = kernel32.GetModuleHandleW("kernel32.dll")
-            load_library_addr = kernel32.GetProcAddress(h_kernel32, b"LoadLibraryW")
+            load_library_addr = self._get_load_library_addr(pid, h_process)
             if not load_library_addr:
-                log.error("GetProcAddress(LoadLibraryW) 失败")
                 return False
 
             h_thread = kernel32.CreateRemoteThread(
@@ -321,7 +454,7 @@ class WeChatHook:
             kernel32.CloseHandle(h_thread)
 
             if exit_code.value == 0:
-                log.error("LoadLibraryW 返回 0, DLL 加载失败 (DLL可能是32位但微信是64位)")
+                log.error("LoadLibraryW 返回 0, DLL 加载失败")
                 return False
 
             log.info("DLL 已注入微信 (PID=%d, module=0x%08X)", pid, exit_code.value)
