@@ -471,7 +471,10 @@ class WeChatHook:
                 if cds.cbData > 0 and cds.lpData:
                     raw = ctypes.string_at(cds.lpData, cds.cbData)
                     try:
-                        text = raw.decode("utf-8").rstrip("\x00")
+                        try:
+                            text = raw.decode("utf-8").rstrip("\x00")
+                        except UnicodeDecodeError:
+                            text = raw.decode("gbk").rstrip("\x00")
                         log.debug("  内容: %s", text[:200])
                         self._handle_message(text)
                     except Exception as e:
