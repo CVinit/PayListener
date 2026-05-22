@@ -1,0 +1,7 @@
+{
+    "CallbackHost": "your-vmq-server.com:8080",
+    "CallbackKey": "your-device-key-here",
+    "Callbackssl": false,
+    "WeChatFolder": "C:\\Program Files (x86)\\Tencent\\WeChat",
+    "HeartbeatInterval": 30
+}
