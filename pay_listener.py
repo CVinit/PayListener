@@ -119,6 +119,8 @@ user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
 user32.FindWindowW.restype = wintypes.HWND
 user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
 user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+user32.SetTimer.argtypes = [wintypes.HWND, ctypes.c_size_t, wintypes.UINT, ctypes.c_void_p]
+user32.SetTimer.restype = ctypes.c_size_t
 
 
 class COPYDATASTRUCT(ctypes.Structure):
@@ -260,28 +262,31 @@ class HeartbeatWorker:
     def __init__(self, client: VmqClient, interval: int = 30):
         self.client = client
         self.interval = interval
-        self._running = False
+        self._stop_event = threading.Event()
         self._thread = None
 
     def start(self):
-        self._running = True
+        self._stop_event.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         log.info("心跳已启动 (间隔=%ds)", self.interval)
 
     def stop(self):
-        self._running = False
+        self._stop_event.set()
         if self._thread:
-            self._thread.join(timeout=5)
+            self._thread.join(timeout=3)
         log.info("心跳已停止")
 
     def _run(self):
-        while self._running:
+        while not self._stop_event.is_set():
             self.client.heartbeat()
-            time.sleep(self.interval)
+            self._stop_event.wait(self.interval)
 
 
 class WeChatHook:
+    MAX_PUSH_RETRIES = 3
+    PUSH_RETRY_DELAY = 2
+
     def __init__(self, dll_path: str):
         self.dll_path = os.path.abspath(dll_path)
         self._hwnd = None
@@ -300,11 +305,16 @@ class WeChatHook:
     def _payment_worker(self):
         while True:
             pay_type, amount = self._payment_queue.get()
-            try:
-                if self._on_payment:
-                    self._on_payment(pay_type, amount)
-            except Exception as e:
-                log.error("推送支付通知失败: %s", e)
+            for attempt in range(1, self.MAX_PUSH_RETRIES + 1):
+                try:
+                    if self._on_payment and self._on_payment(pay_type, amount):
+                        break
+                except Exception as e:
+                    log.error("推送支付通知失败 (第%d次): %s", attempt, e)
+                if attempt < self.MAX_PUSH_RETRIES:
+                    time.sleep(self.PUSH_RETRY_DELAY)
+                else:
+                    log.error("推送支付通知最终失败: type=%d price=%s", pay_type, amount)
             self._payment_queue.task_done()
 
     def find_wechat_pid(self) -> int | None:
@@ -479,12 +489,12 @@ class WeChatHook:
         finally:
             kernel32.CloseHandle(h_process)
 
-    def create_window(self):
+    def create_window(self, on_timer=None):
+        WM_TIMER = 0x0113
+
         def wnd_proc(hwnd, msg, wparam, lparam):
             if msg == WM_COPYDATA:
-                log.debug("收到 WM_COPYDATA 消息")
                 cds = ctypes.cast(lparam, ctypes.POINTER(COPYDATASTRUCT)).contents
-                log.debug("  dwData=%d, cbData=%d, lpData=0x%X", cds.dwData, cds.cbData, cds.lpData or 0)
                 if cds.cbData > 0 and cds.lpData:
                     raw = ctypes.string_at(cds.lpData, cds.cbData)
                     try:
@@ -492,10 +502,12 @@ class WeChatHook:
                             text = raw.decode("utf-8").rstrip("\x00")
                         except UnicodeDecodeError:
                             text = raw.decode("gbk").rstrip("\x00")
-                        log.debug("  内容: %s", text[:200])
                         self._handle_message(text)
                     except Exception as e:
                         log.error("处理消息异常: %s", e)
+                return 0
+            if msg == WM_TIMER and on_timer:
+                on_timer()
                 return 0
             return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
@@ -519,13 +531,6 @@ class WeChatHook:
             return False
 
         log.info("消息窗口已创建 (HWND=0x%X)", self._hwnd)
-
-        verify_hwnd = user32.FindWindowW(None, "支付监听回调")
-        if verify_hwnd:
-            log.info("FindWindowW 验证成功 (HWND=0x%X)", verify_hwnd)
-        else:
-            log.error("FindWindowW 验证失败: 无法通过标题找到窗口")
-
         return True
 
     def run_message_loop(self):
@@ -600,21 +605,29 @@ def main():
     hook = WeChatHook(dll_path)
     hook.set_payment_callback(client.push_payment)
 
-    if not hook.create_window():
+    injected_pid = None
+
+    def check_and_inject():
+        nonlocal injected_pid
+        pid = hook.find_wechat_pid()
+        if pid and pid != injected_pid:
+            log.info("找到微信 (PID=%d), 注入 Hook...", pid)
+            if hook.inject(pid):
+                log.info("Hook 注入成功")
+                injected_pid = pid
+            else:
+                log.error("Hook 注入失败")
+        elif not pid and injected_pid:
+            log.warning("微信已退出, 等待重新启动...")
+            injected_pid = None
+
+    if not hook.create_window(on_timer=check_and_inject):
         log.error("无法创建消息窗口")
         heartbeat.stop()
         return
 
-    log.info("查找微信进程...")
-    pid = hook.find_wechat_pid()
-    if pid:
-        log.info("找到微信 (PID=%d), 注入 Hook...", pid)
-        if hook.inject(pid):
-            log.info("Hook 注入成功")
-        else:
-            log.error("Hook 注入失败")
-    else:
-        log.warning("未找到微信进程, 请先启动微信再重启本程序")
+    check_and_inject()
+    user32.SetTimer(hook._hwnd, 1, 15000, None)
 
     try:
         hook.run_message_loop()
