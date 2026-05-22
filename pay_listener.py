@@ -20,9 +20,10 @@ from dataclasses import dataclass
 import requests
 
 if getattr(sys, "frozen", False):
-    BASE_DIR = os.path.dirname(sys.executable)
+    BASE_DIR = os.path.dirname(os.path.realpath(sys.executable))
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+os.chdir(BASE_DIR)
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 
@@ -379,7 +380,7 @@ def main():
     heartbeat = HeartbeatWorker(client, interval=config.heartbeat_interval)
     heartbeat.start()
 
-    dll_path = os.path.join(BASE_DIR, "PayListener", "WeChatHook.dll")
+    dll_path = os.path.join(BASE_DIR, "WeChatHook.dll")
     hook = WeChatHook(dll_path)
     hook.set_payment_callback(client.push_payment)
 
