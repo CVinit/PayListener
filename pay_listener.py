@@ -319,7 +319,7 @@ class WeChatHook:
         finally:
             kernel32.CloseHandle(h_process)
 
-    def start_message_loop(self):
+    def create_window(self):
         def wnd_proc(hwnd, msg, wparam, lparam):
             if msg == WM_COPYDATA:
                 cds = ctypes.cast(lparam, ctypes.POINTER(COPYDATASTRUCT)).contents
@@ -342,7 +342,7 @@ class WeChatHook:
 
         if not user32.RegisterClassW(ctypes.byref(wc)):
             log.error("RegisterClassW 失败")
-            return
+            return False
 
         self._hwnd = user32.CreateWindowExW(
             0, "PayListenerWnd", "支付监听回调", 0,
@@ -350,10 +350,12 @@ class WeChatHook:
         )
         if not self._hwnd:
             log.error("CreateWindowExW 失败")
-            return
+            return False
 
         log.info("消息窗口已创建, 等待微信收款通知...")
+        return True
 
+    def run_message_loop(self):
         msg = wintypes.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             user32.TranslateMessage(ctypes.byref(msg))
@@ -426,6 +428,11 @@ def main():
     hook = WeChatHook(dll_path)
     hook.set_payment_callback(client.push_payment)
 
+    if not hook.create_window():
+        log.error("无法创建消息窗口")
+        heartbeat.stop()
+        return
+
     log.info("查找微信进程...")
     pid = hook.find_wechat_pid()
     if pid:
@@ -438,7 +445,7 @@ def main():
         log.warning("未找到微信进程, 请先启动微信再重启本程序")
 
     try:
-        hook.start_message_loop()
+        hook.run_message_loop()
     except KeyboardInterrupt:
         pass
     finally:
